@@ -24,6 +24,16 @@
 (define-constant ERR-CANNOT-CANCEL u501)
 (define-constant ERR-BATCH-PARTIAL-FAILURE u502)
 (define-constant ERR-INVALID-BATCH-DATA u503)
+(define-constant ERR-TIP-LIST-FULL u504)
+
+;; Helpers to keep tip indexes compact and avoid hard failures
+(define-private (sanitize-tip-ids (tip-ids (list 100 uint)))
+  (filter is-active-tip tip-ids))
+
+(define-private (is-active-tip (tip-id uint))
+  (match (map-get? tips tip-id)
+    tip-data (not (get claimed tip-data))
+    false))
 
 ;; Enhanced tip function with security, validation, and user tracking
 (define-public (tip (recipient principal) (amount uint) (lock uint))
@@ -47,15 +57,13 @@
       })
       
       ;; Track tips for users (for batch operations and management)
-      (map-set user-tips tx-sender 
-        (unwrap-panic (as-max-len? 
-          (append (default-to (list) (map-get? user-tips tx-sender)) tip-id) 
-          u100)))
+      (let ((tipper-index (sanitize-tip-ids (default-to (list) (map-get? user-tips tx-sender)))))
+        (map-set user-tips tx-sender
+          (unwrap! (as-max-len? (append tipper-index tip-id) u100) (err ERR-TIP-LIST-FULL))))
       
-      (map-set recipient-tips recipient
-        (unwrap-panic (as-max-len? 
-          (append (default-to (list) (map-get? recipient-tips recipient)) tip-id) 
-          u100)))
+      (let ((recipient-index (sanitize-tip-ids (default-to (list) (map-get? recipient-tips recipient)))))
+        (map-set recipient-tips recipient
+          (unwrap! (as-max-len? (append recipient-index tip-id) u100) (err ERR-TIP-LIST-FULL))))
       
       ;; Increment tip ID for next tip
       (var-set next-tip-id (+ tip-id u1))
@@ -115,20 +123,28 @@
       (asserts! (<= recipient-count MAX_BATCH_SIZE) (err ERR-BATCH-LIMIT-EXCEEDED))
       (asserts! (> recipient-count u0) (err ERR-INVALID-BATCH-DATA))
       
-      ;; Process batch tips
-      (ok (fold process-batch-tip 
-                (map create-tip-tuple recipients amounts locks)
-                (list))))))
+      ;; Process batch tips atomically, aborting if any inner tip fails
+      (match (fold process-batch-tip 
+                   (map create-tip-tuple recipients amounts locks)
+                   (ok (list)))
+        processed-ids (ok processed-ids)
+        error-code (err error-code)))))
 
 ;; Helper function to create tip tuples for batch processing
 (define-private (create-tip-tuple (recipient principal) (amount uint) (lock uint))
   { recipient: recipient, amount: amount, lock: lock })
 
 ;; Helper function for batch tipping
-(define-private (process-batch-tip (tip-data { recipient: principal, amount: uint, lock: uint }) (acc (list 10 uint)))
-  (match (tip (get recipient tip-data) (get amount tip-data) (get lock tip-data))
-    tip-id (unwrap-panic (as-max-len? (append acc tip-id) u10))
-    error-val acc))
+(define-private (process-batch-tip (tip-data { recipient: principal, amount: uint, lock: uint }) (acc (response (list 10 uint) uint)))
+  (match acc
+    current-ids
+      (match (tip (get recipient tip-data) (get amount tip-data) (get lock tip-data))
+        tip-id
+          (match (as-max-len? (append current-ids tip-id) u10)
+            updated (ok updated)
+            (err ERR-BATCH-LIMIT-EXCEEDED))
+        err-code (err err-code))
+    err-code (err err-code)))
 
 ;; NEW: Cancel tip function (before unlock period) - Enhanced user control
 (define-public (cancel-tip (id uint))
@@ -204,11 +220,11 @@
 
 ;; NEW: Get all tips for a user (as tipper) - Enhanced user management
 (define-read-only (get-user-tips (user principal))
-  (default-to (list) (map-get? user-tips user)))
+  (sanitize-tip-ids (default-to (list) (map-get? user-tips user))))
 
 ;; NEW: Get all tips for a recipient - Enhanced recipient management
 (define-read-only (get-recipient-tips (recipient principal))
-  (default-to (list) (map-get? recipient-tips recipient)))
+  (sanitize-tip-ids (default-to (list) (map-get? recipient-tips recipient))))
 
 ;; NEW: Get claimable tips for a recipient - Improved UX
 (define-read-only (get-claimable-tips (recipient principal))
